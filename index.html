@@ -4,13 +4,14 @@
     <script>
 
     function scan() {
-      wx.scanQRCode([
+      wx.scanQRCode({
         needResult: 1,
         scanType: ["qrCode"],
         success: function (res) {
-        alert(res.resultStr);
+          alert(res.resultStr);
         }
       });
+    }
     </script>
   </head>
 <body>
