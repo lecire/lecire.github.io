@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Live Stream</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    cursor: none;
+  }
+  #video {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    object-fit: contain;
+    background: #000;
+  }
+  #status {
+    position: fixed;
+    bottom: 10px;
+    right: 10px;
+    color: #555;
+    font-family: monospace;
+    font-size: 12px;
+    z-index: 10;
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+</head>
+<body>
+  <video id="video" autoplay muted playsinline webkit-playsinline></video>
+  <div id="status"></div>
+
+<script>
+(function() {
+  const videoSrc = 'https://liveprodusphoenixeast.global.ssl.fastly.net/USPhx-HD/Channel-TX-USPhx-AWS-virginia-1/Source-USPhx-16k-1-s6lk2-BP-07-02-81ykIWnsMsg_live.m3u8';
+  const video = document.getElementById('video');
+  const statusEl = document.getElementById('status');
+  let hls = null;
+  let recoverAttempts = 0;
+  let lastCurrentTime = 0;
+  let stalledTicks = 0;
+
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    statusEl.textContent = '[' + t + '] ' + msg;
+    console.log('[player]', msg);
+  }
+
+  // --- Keep screen awake (Wake Lock API, if supported) ---
+  let wakeLock = null;
+  async function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // --- Fullscreen helpers ---
+  function enterFullscreen() {
+    const el = document.documentElement;
+    const req = el.requestFullscreen || el.webkitRequestFullscreen ||
+                el.mozRequestFullScreen || el.msRequestFullscreen;
+    if (req && !document.fullscreenElement && !document.webkitFullscreenElement) {
+      try { req.call(el); } catch (e) {}
+    }
+  }
+
+  // --- Load/reload the stream ---
+  function loadStream() {
+    destroyHls();
+    if (window.Hls && Hls.isSupported()) {
+      hls = new Hls({
+        liveDurationInfinity: true,
+        lowLatencyMode: false,
+        manifestLoadingTimeOut: 15000,
+        manifestLoadingMaxRetry: 8,
+        manifestLoadingRetryDelay: 2000,
+        levelLoadingTimeOut: 15000,
+        levelLoadingMaxRetry: 8,
+        levelLoadingRetryDelay: 2000,
+        fragLoadingTimeOut: 30000,
+        fragLoadingMaxRetry: 8,
+        fragLoadingRetryDelay: 2000,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60
+      });
+      hls.loadSource(videoSrc);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, function() {
+        log('manifest parsed, playing');
+        video.play().catch(() => {});
+      });
+      hls.on(Hls.Events.ERROR, function(event, data) {
+        log('hls error: ' + data.type + '/' + data.details + (data.fatal ? ' (fatal)' : ''));
+        if (data.fatal) {
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              try { hls.startLoad(); } catch (e) { scheduleReload(); }
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              try { hls.recoverMediaError(); } catch (e) { scheduleReload(); }
+              break;
+            default:
+              scheduleReload();
+          }
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = videoSrc;
+      video.addEventListener('loadedmetadata', function() {
+        video.play().catch(() => {});
+      }, { once: true });
+    } else {
+      log('HLS not supported');
+    }
+  }
+
+  function destroyHls() {
+    if (hls) {
+      try { hls.destroy(); } catch (e) {}
+      hls = null;
+    }
+  }
+
+  let reloadTimer = null;
+  function scheduleReload(delay) {
+    if (reloadTimer) return;
+    recoverAttempts++;
+    const wait = delay || Math.min(30000, 2000 * recoverAttempts);
+    log('scheduling reload in ' + wait + 'ms (attempt ' + recoverAttempts + ')');
+    reloadTimer = setTimeout(function() {
+      reloadTimer = null;
+      loadStream();
+      setTimeout(() => { video.play().catch(() => {}); }, 500);
+    }, wait);
+  }
+
+  // --- Watchdog: detects stalls and wake-ups ---
+  setInterval(function() {
+    // Try to play if paused (e.g. after wake)
+    if (video.paused || video.ended) {
+      log('video paused/ended, resuming');
+      video.play().catch(() => {});
+    }
+
+    // Detect stall (time not advancing)
+    if (!video.paused) {
+      if (video.currentTime === lastCurrentTime) {
+        stalledTicks++;
+        if (stalledTicks >= 3) { // ~6 seconds stuck
+          log('stall detected, reloading stream');
+          stalledTicks = 0;
+          recoverAttempts = 0;
+          loadStream();
+        }
+      } else {
+        stalledTicks = 0;
+        recoverAttempts = 0;
+      }
+      lastCurrentTime = video.currentTime;
+    }
+
+    // For live streams, jump to live edge if we fell behind
+    if (video.buffered.length > 0) {
+      const liveEdge = video.buffered.end(video.buffered.length - 1);
+      if (liveEdge - video.currentTime > 10) {
+        video.currentTime = Math.max(0, liveEdge - 2);
+      }
+    }
+
+    // Ensure wake lock
+    if (!wakeLock) requestWakeLock();
+  }, 2000);
+
+  // --- Visibility handlers (screen off -> on) ---
+  document.addEventListener('visibilitychange', function() {
+    log('visibility: ' + document.visibilityState);
+    if (document.visibilityState === 'visible') {
+      requestWakeLock();
+      setTimeout(function() {
+        video.play().catch(() => {});
+        // If video doesn't come back within a moment, reload
+        setTimeout(function() {
+          if (video.paused || video.readyState < 2) {
+            log('video not resumed after wake, reloading');
+            loadStream();
+          }
+        }, 3000);
+      }, 300);
+    }
+  });
+
+  window.addEventListener('focus', function() {
+    log('window focus');
+    video.play().catch(() => {});
+  });
+
+  window.addEventListener('pageshow', function() {
+    log('pageshow');
+    video.play().catch(() => {});
+  });
+
+  window.addEventListener('online', function() {
+    log('network online, reloading stream');
+    loadStream();
+  });
+
+  // --- Video element event handlers ---
+  video.addEventListener('pause', function() {
+    // Prevent accidental pauses (e.g. after wake)
+    setTimeout(() => video.play().catch(() => {}), 100);
+  });
+
+  video.addEventListener('ended', function() {
+    log('ended, reloading');
+    loadStream();
+  });
+
+  video.addEventListener('error', function() {
+    log('video element error, reloading');
+    scheduleReload(2000);
+  });
+
+  video.addEventListener('stalled', function() { log('stalled event'); });
+  video.addEventListener('waiting', function() { log('waiting/buffering'); });
+  video.addEventListener('playing', function() {
+    log('playing');
+    recoverAttempts = 0;
+  });
+
+  // --- User interaction triggers fullscreen (required by some browsers) ---
+  function onFirstInteraction() {
+    enterFullscreen();
+    requestWakeLock();
+    video.play().catch(() => {});
+  }
+  document.addEventListener('click', onFirstInteraction);
+  document.addEventListener('keydown', onFirstInteraction);
+  document.addEventListener('touchstart', onFirstInteraction);
+
+  // --- Start ---
+  log('starting');
+  requestWakeLock();
+  loadStream();
+  // Try fullscreen early (works on TV browsers that allow it without gesture)
+  setTimeout(enterFullscreen, 500);
+})();
+</script>
+</body>
+</html>
