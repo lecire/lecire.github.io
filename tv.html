@@ -12,7 +12,10 @@
     height: 100%;
     background: #000;
     overflow: hidden;
-    cursor: none;
+    cursor: none !important;
+  }
+  *, *::before, *::after {
+    cursor: none !important;
   }
   #video {
     position: fixed;
@@ -22,6 +25,19 @@
     height: 100vh;
     object-fit: contain;
     background: #000;
+    cursor: none !important;
+  }
+  /* Tiny transparent overlay that "catches" the cursor in a corner */
+  #cursor-sink {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 1px;
+    height: 1px;
+    cursor: none !important;
+    z-index: 9999;
+    opacity: 0;
+    pointer-events: none;
   }
   #status {
     position: fixed;
@@ -31,12 +47,14 @@
     font-family: monospace;
     font-size: 12px;
     z-index: 10;
+    cursor: none !important;
   }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 </head>
 <body>
-  <video id="video" autoplay muted playsinline webkit-playsinline></video>
+  <video id="video" autoplay playsinline webkit-playsinline></video>
+  <div id="cursor-sink"></div>
   <div id="status"></div>
 
 <script>
@@ -54,6 +72,25 @@
     statusEl.textContent = '[' + t + '] ' + msg;
     console.log('[player]', msg);
   }
+
+  // --- Hide cursor: apply cursor:none everywhere and keep re-applying ---
+  function hideCursor() {
+    document.documentElement.style.cursor = 'none';
+    document.body.style.cursor = 'none';
+    video.style.cursor = 'none';
+  }
+  hideCursor();
+
+  // Any mouse movement: re-hide the cursor.
+  // On some Tizen browsers the cursor auto-hides after inactivity,
+  // so ignoring mouse events (no interaction) makes it disappear.
+  let hideTimer = null;
+  document.addEventListener('mousemove', function() {
+    hideCursor();
+    // Reset any TV-native cursor-idle timer
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(hideCursor, 100);
+  }, true);
 
   // --- Keep screen awake (Wake Lock API, if supported) ---
   let wakeLock = null;
@@ -99,7 +136,7 @@
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, function() {
         log('manifest parsed, playing');
-        video.play().catch(() => {});
+        tryPlay();
       });
       hls.on(Hls.Events.ERROR, function(event, data) {
         log('hls error: ' + data.type + '/' + data.details + (data.fatal ? ' (fatal)' : ''));
@@ -119,10 +156,30 @@
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = videoSrc;
       video.addEventListener('loadedmetadata', function() {
-        video.play().catch(() => {});
+        tryPlay();
       }, { once: true });
     } else {
       log('HLS not supported');
+    }
+  }
+
+  // --- Play helper that handles autoplay-with-sound restriction ---
+  function tryPlay() {
+    const p = video.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch(function(err) {
+        log('play blocked (' + err.name + '), retrying muted');
+        // If autoplay with sound is blocked, fall back to muted,
+        // then unmute as soon as possible.
+        video.muted = true;
+        video.play().then(function() {
+          // Try unmuting after a brief delay
+          setTimeout(function() {
+            video.muted = false;
+            if (video.paused) video.play().catch(() => {});
+          }, 500);
+        }).catch(() => {});
+      });
     }
   }
 
@@ -142,23 +199,23 @@
     reloadTimer = setTimeout(function() {
       reloadTimer = null;
       loadStream();
-      setTimeout(() => { video.play().catch(() => {}); }, 500);
+      setTimeout(tryPlay, 500);
     }, wait);
   }
 
   // --- Watchdog: detects stalls and wake-ups ---
   setInterval(function() {
-    // Try to play if paused (e.g. after wake)
+    hideCursor();
+
     if (video.paused || video.ended) {
       log('video paused/ended, resuming');
-      video.play().catch(() => {});
+      tryPlay();
     }
 
-    // Detect stall (time not advancing)
     if (!video.paused) {
       if (video.currentTime === lastCurrentTime) {
         stalledTicks++;
-        if (stalledTicks >= 3) { // ~6 seconds stuck
+        if (stalledTicks >= 3) {
           log('stall detected, reloading stream');
           stalledTicks = 0;
           recoverAttempts = 0;
@@ -171,7 +228,6 @@
       lastCurrentTime = video.currentTime;
     }
 
-    // For live streams, jump to live edge if we fell behind
     if (video.buffered.length > 0) {
       const liveEdge = video.buffered.end(video.buffered.length - 1);
       if (liveEdge - video.currentTime > 10) {
@@ -179,7 +235,6 @@
       }
     }
 
-    // Ensure wake lock
     if (!wakeLock) requestWakeLock();
   }, 2000);
 
@@ -188,9 +243,9 @@
     log('visibility: ' + document.visibilityState);
     if (document.visibilityState === 'visible') {
       requestWakeLock();
+      hideCursor();
       setTimeout(function() {
-        video.play().catch(() => {});
-        // If video doesn't come back within a moment, reload
+        tryPlay();
         setTimeout(function() {
           if (video.paused || video.readyState < 2) {
             log('video not resumed after wake, reloading');
@@ -203,12 +258,14 @@
 
   window.addEventListener('focus', function() {
     log('window focus');
-    video.play().catch(() => {});
+    hideCursor();
+    tryPlay();
   });
 
   window.addEventListener('pageshow', function() {
     log('pageshow');
-    video.play().catch(() => {});
+    hideCursor();
+    tryPlay();
   });
 
   window.addEventListener('online', function() {
@@ -218,8 +275,7 @@
 
   // --- Video element event handlers ---
   video.addEventListener('pause', function() {
-    // Prevent accidental pauses (e.g. after wake)
-    setTimeout(() => video.play().catch(() => {}), 100);
+    setTimeout(function() { if (video.paused) tryPlay(); }, 100);
   });
 
   video.addEventListener('ended', function() {
@@ -239,11 +295,13 @@
     recoverAttempts = 0;
   });
 
-  // --- User interaction triggers fullscreen (required by some browsers) ---
+  // --- First interaction: go fullscreen, unmute, and lock cursor hidden ---
   function onFirstInteraction() {
     enterFullscreen();
     requestWakeLock();
-    video.play().catch(() => {});
+    hideCursor();
+    video.muted = false;
+    tryPlay();
   }
   document.addEventListener('click', onFirstInteraction);
   document.addEventListener('keydown', onFirstInteraction);
@@ -253,7 +311,6 @@
   log('starting');
   requestWakeLock();
   loadStream();
-  // Try fullscreen early (works on TV browsers that allow it without gesture)
   setTimeout(enterFullscreen, 500);
 })();
 </script>
